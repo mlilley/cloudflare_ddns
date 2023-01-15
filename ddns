@@ -1,0 +1,102 @@
+#!/bin/bash
+
+# Cloudflare DDNS updater.
+#
+# Assumes you have cloudflare account hosting the dns for some domain, and that 
+# you've created an API key with permissions to edit the zone for that domain.
+# The record should be of type "A", and unlocked.
+#
+# Requires jq.
+
+
+# --- [configuration] ---
+# Cloudflare Email address of cloudflare account:
+email="someone@example.com"
+# Cloudflare api token (with edit dns zone permissions):
+token="xyz"
+# Name of domain hosted by Cloudflare DNS:
+domain="example.com"
+# Name of record in zone (including the domain, ie: subdomain.domain.com):
+record="acme.example.com"
+# --- [end configuration] ---
+
+
+function cfget() {
+    echo "$(curl "$1" \
+        -s \
+        -X GET \
+        -H "Content-Type: application/json" \
+        -H "X-Auth-Email: $email" \
+        -H "Authorization: Bearer $token")"
+}
+
+function cfput() {
+    echo "$(curl "$1" \
+        -s \
+        -X PUT \
+        -H "Content-Type: application/json" \
+        -H "X-Auth-Email: $email" \
+        -H "Authorization: Bearer $token" \
+        -d $2)"
+}
+
+ip="$(curl -s 'https://api.ipify.org?format=json' | jq -r ".ip")"
+if [[ -z $ip ]]; then
+    echo -e "Error: failed to obtain public ip address:\n$ip"
+    exit 1
+fi
+echo "Current public IPv4 address is: $ip"
+
+# verify token validity
+result="$(cfget "https://api.cloudflare.com/client/v4/user/tokens/verify")"
+success="$(echo "$result" | jq -r ".success")"
+if [[ $success != "true" ]]; then
+    echo "Error: token invalid"
+    exit 1
+fi
+
+# get zone id
+result="$(cfget "https://api.cloudflare.com/client/v4/zones?name=$domain")"
+success="$(echo "$result" | jq -r ".success")"
+if [[ $success != "true" ]]; then
+    echo -e "Error: unable to fetch zone id for domain '$domain':\n$result"
+    exit 1
+fi
+zoneid="$(echo "$result" | jq -r ".result | .[0] | .id")"
+
+# get record details
+result="$(cfget "https://api.cloudflare.com/client/v4/zones/$zoneid/dns_records?name=$record")"
+success="$(echo "$result" | jq -r ".success")"
+if [[ $success != "true" ]]; then
+    echo -e "Error: unable to fetch details for record '$record':\n:$result"
+    exit 1
+fi
+count="$(echo "$result" | jq -r ".result | length")"
+if [[ $count -eq 0 ]]; then
+    echo -e "Error: no record found with name '$record':\n$result"
+    exit 1
+fi
+record_id="$(echo "$result" | jq -r ".result | .[0] | .id")"
+record_content="$(echo "$result" | jq -r ".result | .[0] | .content")"
+record_type="$(echo "$result" | jq -r ".result | .[0] | .type")"
+record_ttl="$(echo "$result" | jq -r ".result | .[0] | .ttl")"
+record_proxied="$(echo "$result" | jq -r ".result | .[0] | .proxied")"
+
+echo "Current target for DNS record '$record': $record_content"
+
+# stop if the current record target is same as what we want to set
+if [[ "$record_content" == "$ip" ]]; then
+    echo -e "Success: no update required"
+    exit 0
+fi
+
+# update record details
+data="{\"name\":\"$record\",\"content\":\"$ip\",\"type\":\"$record_type\",\"ttl\":$record_ttl,\"proxied\":$record_proxied}"
+result="$(cfput "https://api.cloudflare.com/client/v4/zones/$zoneid/dns_records/$record_id" "$data")"
+success="$(echo "$result" | jq -r ".success")"
+if [[ $success != "true" ]]; then
+    echo -e "Error: failed to update dns:\n$result"
+    exit 1
+fi
+
+echo "Success: dns updated"
